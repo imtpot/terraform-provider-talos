@@ -74,6 +74,53 @@ func TestAccTalosMachine_bootstrap(t *testing.T) {
 	})
 }
 
+// TestAccTalosMachine_bootstrapWithSchematic upgrades a node that booted from a
+// vanilla ISO to a Factory installer with the same Talos version. This exercises the
+// talos_machine Create path used by VM providers that start from a shared base image.
+func TestAccTalosMachine_bootstrapWithSchematic(t *testing.T) {
+	const (
+		talosVersion = "v1.14.0"
+		factoryImage = "factory.talos.dev/metal-installer/${talos_image_factory_schematic.this.id}"
+	)
+
+	rName := acctest.RandStringFromCharSet(10, acctest.CharSetAlpha)
+
+	// Register the schematic with Factory before the node pulls its installer.
+	config := testAccTalosMachineConfigWithoutInstallImage(rName, factoryImage, talosVersion, talosVersion) + `
+resource "talos_image_factory_schematic" "this" {}
+`
+
+	resource.ParallelTest(t, resource.TestCase{
+		ExternalProviders: map[string]resource.ExternalProvider{
+			"libvirt": {
+				Source:            "dmacvicar/libvirt",
+				VersionConstraint: "= 0.8.3",
+			},
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					func(s *terraform.State) error {
+						schematic, ok := s.RootModule().Resources["talos_image_factory_schematic.this"]
+						if !ok || schematic.Primary == nil || schematic.Primary.ID == "" {
+							return fmt.Errorf("factory schematic is missing from state")
+						}
+
+						return checkNodeSchematic("talos_machine.this", schematic.Primary.ID)(s)
+					},
+					resource.TestCheckResourceAttrSet("data.talos_cluster_health.this", "id"),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 // TestAccTalosMachine_drainWorkerUpgrade verifies that drain_on_upgrade = true works
 // on worker nodes when kubeconfig_wo is provided. Workers do not serve the Talos
 // kubeconfig API, so the provider must use the supplied kubeconfig to cordon and drain.
@@ -891,6 +938,14 @@ func installDiskPatch(talosVersion, image string) string {
 }
 
 func testAccTalosMachineConfig(rName, imageUrl, imageTag, isoVersion string) string {
+	return testAccTalosMachineConfigWithInstallImage(rName, imageUrl, imageTag, isoVersion, true)
+}
+
+func testAccTalosMachineConfigWithoutInstallImage(rName, imageUrl, imageTag, isoVersion string) string {
+	return testAccTalosMachineConfigWithInstallImage(rName, imageUrl, imageTag, isoVersion, false)
+}
+
+func testAccTalosMachineConfigWithInstallImage(rName, imageUrl, imageTag, isoVersion string, includeInstallImage bool) string {
 	cpuMode := cpuModeDefault
 	if os.Getenv("CI") != "" {
 		cpuMode = cpuModeCI
@@ -900,6 +955,11 @@ func testAccTalosMachineConfig(rName, imageUrl, imageTag, isoVersion string) str
 		"https://github.com/siderolabs/talos/releases/download/%s/metal-amd64.iso",
 		isoVersion,
 	)
+
+	configPatch := installDiskPatch(imageTag, "")
+	if includeInstallImage {
+		configPatch = installDiskPatch(imageTag, fmt.Sprintf("%s:%s", imageUrl, isoVersion))
+	}
 
 	return fmt.Sprintf(`
 resource "talos_machine_secrets" "this" {}
@@ -1009,8 +1069,7 @@ data "talos_cluster_health" "this" {
     read = "25m"
   }
 }
-`, rName, cpuMode, isoURL, imageUrl, imageTag, isoVersion,
-		installDiskPatch(imageTag, fmt.Sprintf("%s:%s", imageUrl, isoVersion)))
+`, rName, cpuMode, isoURL, imageUrl, imageTag, isoVersion, configPatch)
 }
 
 // testAccTalosMachineConfigWithWriteOnlyAttrs uses ephemeral talos_machine_secrets and

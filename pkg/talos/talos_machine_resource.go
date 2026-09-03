@@ -36,6 +36,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	configresource "github.com/siderolabs/talos/pkg/machinery/resources/config"
+	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	talosreporter "github.com/siderolabs/talos/pkg/reporter"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -844,19 +845,97 @@ func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig
 	return nil
 }
 
-// talosMachineUpgradeIfNeeded checks the running Talos version and, if it differs from
-// the desired image, performs: pull → install → drain → reboot → uncordon.
+// talosMachineUpgradeIfNeeded checks the running Talos version and, for Image Factory
+// images, the active schematic. If either differs from the desired image, it performs:
+// pull → install → drain → reboot → uncordon.
 func talosMachineUpgradeIfNeeded(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel) (retErr error) {
 	runningImage, err := talosMachineRunningVersion(ctx, endpoint, node, talosConfig, state.Image.ValueString())
 	if err != nil {
 		return fmt.Errorf("reading running version: %w", err)
 	}
 
-	if runningImage == state.Image.ValueString() {
+	if runningImage != state.Image.ValueString() {
+		return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state)
+	}
+
+	requestedSchematic, isImageFactoryImage := talosMachineImageFactorySchematic(state.Image.ValueString())
+	if !isImageFactoryImage {
+		return nil
+	}
+
+	runningSchematic, err := talosMachineRunningSchematic(ctx, endpoint, node, talosConfig)
+	if err != nil {
+		return fmt.Errorf("reading active Image Factory schematic: %w", err)
+	}
+
+	if runningSchematic == requestedSchematic {
 		return nil
 	}
 
 	return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state)
+}
+
+// talosMachineImageFactorySchematic returns the schematic ID embedded in the standard
+// Image Factory installer repository layout:
+// <registry>/[<platform>-]installer[-secureboot]/<schematic>:<version>.
+func talosMachineImageFactorySchematic(imageRef string) (string, bool) {
+	if strings.Contains(imageRef, "@") {
+		return "", false
+	}
+
+	repository := imageRef
+	lastSlash := strings.LastIndex(repository, "/")
+
+	if tagStart := strings.LastIndex(repository, ":"); tagStart > lastSlash {
+		repository = repository[:tagStart]
+	}
+
+	parts := strings.Split(repository, "/")
+	if len(parts) < 2 {
+		return "", false
+	}
+
+	installerRepository := parts[len(parts)-2]
+	schematicID := parts[len(parts)-1]
+	isFactoryInstaller := installerRepository == "installer" ||
+		installerRepository == "installer-secureboot" ||
+		strings.HasSuffix(installerRepository, "-installer") ||
+		strings.HasSuffix(installerRepository, "-installer-secureboot")
+
+	if schematicID == "" || !isFactoryInstaller {
+		return "", false
+	}
+
+	return schematicID, true
+}
+
+// talosMachineRunningSchematic reads the Image Factory schematic reported by Talos as
+// an ExtensionStatus pseudo-extension. A vanilla image has no such status and returns
+// an empty ID, which intentionally differs from every requested Factory schematic.
+func talosMachineRunningSchematic(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config) (string, error) {
+	var schematicID string
+
+	err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
+		items, err := safe.StateListAll[*runtimeres.ExtensionStatus](nodeCtx, c.COSI)
+		if err != nil {
+			return err
+		}
+
+		for item := range items.All() {
+			if item.TypedSpec().Metadata.Name == "schematic" {
+				schematicID = item.TypedSpec().Metadata.Version
+
+				break
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return schematicID, nil
 }
 
 func talosMachineRunningVersion(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, desiredImage string) (string, error) {
