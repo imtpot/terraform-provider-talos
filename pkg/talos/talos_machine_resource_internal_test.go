@@ -147,3 +147,63 @@ func TestTalosMachineReconcileRunningImage(t *testing.T) {
 		})
 	}
 }
+
+func TestTalosMachineImageFactorySchematic(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		imageRef  string
+		schematic string
+		ok        bool
+	}{
+		"bare installer": {
+			imageRef:  "factory.talos.dev/installer/abc123:v1.13.0",
+			schematic: "abc123",
+			ok:        true,
+		},
+		"bare secure boot installer": {
+			imageRef:  "factory.talos.dev/installer-secureboot/abc123:v1.13.0",
+			schematic: "abc123",
+			ok:        true,
+		},
+		"default factory": {
+			imageRef:  "factory.talos.dev/metal-installer/abc123:v1.13.0",
+			schematic: "abc123",
+			ok:        true,
+		},
+		"custom registry": {
+			imageRef:  "images.example.com/talos/openstack-installer/def456:v1.13.0",
+			schematic: "def456",
+			ok:        true,
+		},
+		"registry with port and secure boot": {
+			imageRef:  "images.example.com:5000/metal-installer-secureboot/789abc:v1.13.0",
+			schematic: "789abc",
+			ok:        true,
+		},
+		"standard installer": {
+			imageRef: "ghcr.io/siderolabs/installer:v1.13.0",
+		},
+		"factory artifact": {
+			imageRef: "factory.talos.dev/image/abc123/v1.13.0/metal-amd64.raw.xz",
+		},
+		"digest": {
+			imageRef: "factory.talos.dev/metal-installer/abc123@sha256:1234",
+		},
+		"empty schematic": {
+			imageRef: "factory.talos.dev/metal-installer/:v1.13.0",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			schematic, ok := talosMachineImageFactorySchematic(test.imageRef)
+			if schematic != test.schematic || ok != test.ok {
+				t.Fatalf("talosMachineImageFactorySchematic(%q) = (%q, %t), want (%q, %t)",
+					test.imageRef, schematic, ok, test.schematic, test.ok)
+			}
+		})
+	}
+}

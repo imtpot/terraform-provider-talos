@@ -74,6 +74,63 @@ func TestAccTalosMachine_bootstrap(t *testing.T) {
 	})
 }
 
+// TestAccTalosMachine_bootstrapWithSchematic boots a vanilla ISO and leaves the
+// initial install image at its default. Only talos_machine.image requests the
+// non-default Factory schematic, exercising same-version reconciliation on Create.
+func TestAccTalosMachine_bootstrapWithSchematic(t *testing.T) {
+	const (
+		talosVersion = "v1.14.0"
+		factoryImage = "factory.talos.dev/metal-installer/${talos_image_factory_schematic.this.id}"
+	)
+
+	rName := acctest.RandStringFromCharSet(10, acctest.CharSetAlpha)
+
+	// Register the schematic with Factory before the node pulls its installer.
+	config := testAccTalosMachineConfigWithoutInstallImage(rName, factoryImage, talosVersion, talosVersion) + `
+resource "talos_image_factory_schematic" "this" {
+  schematic = yamlencode({
+    customization = {
+      extraKernelArgs = ["console=ttyS0"]
+    }
+  })
+}
+`
+
+	resource.ParallelTest(t, resource.TestCase{
+		ExternalProviders: map[string]resource.ExternalProvider{
+			"libvirt": {
+				Source:            "dmacvicar/libvirt",
+				VersionConstraint: "= 0.8.3",
+			},
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					func(s *terraform.State) error {
+						schematic, ok := s.RootModule().Resources["talos_image_factory_schematic.this"]
+						if !ok || schematic.Primary == nil || schematic.Primary.ID == "" {
+							return fmt.Errorf("factory schematic is missing from state")
+						}
+
+						if schematic.Primary.ID == images.DefaultInstallerImageSchematic {
+							return fmt.Errorf("test schematic must differ from the initial installer schematic")
+						}
+
+						return checkNodeSchematic("talos_machine.this", schematic.Primary.ID)(s)
+					},
+					resource.TestCheckResourceAttrSet("data.talos_cluster_health.this", "id"),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 // TestAccTalosMachine_drainWorkerUpgrade verifies that drain_on_upgrade = true works
 // on worker nodes when kubeconfig_wo is provided. Workers do not serve the Talos
 // kubeconfig API, so the provider must use the supplied kubeconfig to cordon and drain.
@@ -891,6 +948,14 @@ func installDiskPatch(talosVersion, image string) string {
 }
 
 func testAccTalosMachineConfig(rName, imageUrl, imageTag, isoVersion string) string {
+	return testAccTalosMachineConfigWithInstallImage(rName, imageUrl, imageTag, isoVersion, true)
+}
+
+func testAccTalosMachineConfigWithoutInstallImage(rName, imageUrl, imageTag, isoVersion string) string {
+	return testAccTalosMachineConfigWithInstallImage(rName, imageUrl, imageTag, isoVersion, false)
+}
+
+func testAccTalosMachineConfigWithInstallImage(rName, imageUrl, imageTag, isoVersion string, includeInstallImage bool) string {
 	cpuMode := cpuModeDefault
 	if os.Getenv("CI") != "" {
 		cpuMode = cpuModeCI
@@ -900,6 +965,11 @@ func testAccTalosMachineConfig(rName, imageUrl, imageTag, isoVersion string) str
 		"https://github.com/siderolabs/talos/releases/download/%s/metal-amd64.iso",
 		isoVersion,
 	)
+
+	configPatch := installDiskPatch(imageTag, "")
+	if includeInstallImage {
+		configPatch = installDiskPatch(imageTag, fmt.Sprintf("%s:%s", imageUrl, isoVersion))
+	}
 
 	return fmt.Sprintf(`
 resource "talos_machine_secrets" "this" {}
@@ -1009,8 +1079,7 @@ data "talos_cluster_health" "this" {
     read = "25m"
   }
 }
-`, rName, cpuMode, isoURL, imageUrl, imageTag, isoVersion,
-		installDiskPatch(imageTag, fmt.Sprintf("%s:%s", imageUrl, isoVersion)))
+`, rName, cpuMode, isoURL, imageUrl, imageTag, isoVersion, configPatch)
 }
 
 // testAccTalosMachineConfigWithWriteOnlyAttrs uses ephemeral talos_machine_secrets and
@@ -1916,7 +1985,7 @@ func TestNodeRequiresReplace(t *testing.T) {
 // TestDefaultTimeoutsSufficientForWorstCase verifies that the default Create and
 // Update timeouts cover the worst-case internal retry budgets:
 //
-//	Create: must exceed 20 m (10 m apply + 10 m wait-for-node)
+//	Create: must exceed 35 m (10 m apply + 10 m wait-for-node + 15 m reboot)
 //	Update: must exceed 80 m (10+10+60 m with legacy upgrade)
 func TestDefaultTimeoutsSufficientForWorstCase(t *testing.T) {
 	t.Parallel()
@@ -1924,6 +1993,7 @@ func TestDefaultTimeoutsSufficientForWorstCase(t *testing.T) {
 	const (
 		applyRetryBudget    = 10 * time.Minute
 		waitNodeBudget      = 10 * time.Minute
+		rebootBudget        = 15 * time.Minute
 		legacyUpgradeBudget = 60 * time.Minute
 	)
 
@@ -1932,7 +2002,7 @@ func TestDefaultTimeoutsSufficientForWorstCase(t *testing.T) {
 	defaultCreate := talos.DefaultCreateTimeout
 	defaultUpdate := talos.DefaultUpdateTimeout
 
-	worstCaseCreate := applyRetryBudget + waitNodeBudget                       // 20 m
+	worstCaseCreate := applyRetryBudget + waitNodeBudget + rebootBudget        // 35 m
 	worstCaseUpdate := applyRetryBudget + waitNodeBudget + legacyUpgradeBudget // 80 m
 
 	if defaultCreate < worstCaseCreate {

@@ -14,6 +14,7 @@ import (
 
 	cosiresource "github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/safe"
+	cosistate "github.com/cosi-project/runtime/pkg/state"
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -36,6 +37,8 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	configresource "github.com/siderolabs/talos/pkg/machinery/resources/config"
+	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
+	serviceres "github.com/siderolabs/talos/pkg/machinery/resources/v1alpha1"
 	talosreporter "github.com/siderolabs/talos/pkg/reporter"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -47,7 +50,7 @@ import (
 // for talos_machine timeouts. Exported so tests can assert they cover the
 // worst-case internal retry budgets without duplicating magic numbers.
 const (
-	DefaultCreateTimeout = 25 * time.Minute // 10m apply + 10m wait-for-node + margin
+	DefaultCreateTimeout = 40 * time.Minute // 10m apply + 10m wait-for-node + 15m create reboot + margin
 	DefaultUpdateTimeout = 90 * time.Minute // above + 60m legacy upgrade poll + margin
 )
 
@@ -648,7 +651,7 @@ func (r *talosMachineResource) Update(ctx context.Context, req resource.UpdateRe
 	imageChanged := !plan.Image.IsNull() && !plan.Image.Equal(state.Image)
 
 	if imageChanged {
-		if err := talosMachineUpgrade(ctxDeadline, endpoint, plan.Node.ValueString(), talosConfig, &plan); err != nil {
+		if err := talosMachineUpgrade(ctxDeadline, endpoint, plan.Node.ValueString(), talosConfig, &plan, true); err != nil {
 			resp.Diagnostics.AddError("error upgrading Talos", err.Error())
 
 			return
@@ -752,7 +755,7 @@ func (r *talosMachineResource) Delete(ctx context.Context, req resource.DeleteRe
 }
 
 // talosMachineApplyConfig applies the machine configuration with retry and waits for
-// the node to be reachable afterwards (it reboots on first config apply).
+// CRI to be ready during normal boot (first apply can install and reboot).
 func talosMachineApplyConfig(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, cfgBytes []byte) error {
 	if err := retry.RetryContext(ctx, 10*time.Minute, func() *retry.RetryError {
 		if err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
@@ -775,23 +778,86 @@ func talosMachineApplyConfig(ctx context.Context, endpoint, node string, talosCo
 		return fmt.Errorf("applying configuration: %w", err)
 	}
 
-	// Poll until node is back up — it may have rebooted after first config apply.
-	return retry.RetryContext(ctx, 10*time.Minute, func() *retry.RetryError {
-		if err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
-			_, err := c.Version(nodeCtx)
+	// The API also responds during maintenance and early boot. Wait until the
+	// node is out of maintenance and CRI is ready before reading extensions or pulling an installer.
+	return talosMachineWaitForBoot(ctx, endpoint, node, talosConfig, talosClientOp)
+}
 
-			return err
-		}); err != nil {
-			return retry.RetryableError(err)
+func talosMachineWaitForBoot(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, op clientOpFunc) error {
+	return retry.RetryContext(ctx, 10*time.Minute, func() *retry.RetryError {
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		if err := op(attemptCtx, endpoint, node, talosConfig, talosMachineCheckBootReadyOrVersion); err != nil {
+			return talosMachineBootRetryError(err)
 		}
 
 		return nil
 	})
 }
 
+func talosMachineBootRetryError(err error) *retry.RetryError {
+	if code := status.Code(err); code == codes.PermissionDenied || code == codes.Unauthenticated || code == codes.InvalidArgument {
+		return retry.NonRetryableError(err)
+	}
+
+	return retry.RetryableError(err)
+}
+
+// Fall back to Version when the role cannot read runtime resources.
+func talosMachineCheckBootReadyOrVersion(ctx context.Context, c *client.Client) error {
+	err := talosMachineCheckBootReady(ctx, c)
+	if status.Code(err) != codes.PermissionDenied {
+		return err
+	}
+
+	_, err = c.Version(ctx)
+
+	return err
+}
+
+func talosMachineCheckBootReady(ctx context.Context, c *client.Client) error {
+	machine, err := safe.StateGet[*runtimeres.MachineStatus](ctx, c.COSI, runtimeres.NewMachineStatus().Metadata())
+	if err != nil {
+		return fmt.Errorf("reading machine boot status: %w", err)
+	}
+
+	if stage := machine.TypedSpec().Stage; stage != runtimeres.MachineStageBooting && stage != runtimeres.MachineStageRunning {
+		return fmt.Errorf("waiting for normal boot: stage is %s", stage)
+	}
+
+	// Talos 1.14 keeps this status at waiting-for-reboot until the first
+	// install's reboot has actually happened. Older Talos has no such resource.
+	install, err := safe.StateGet[*runtimeres.UnattendedInstallStatus](ctx, c.COSI, runtimeres.NewUnattendedInstallStatus().Metadata())
+	// Older COSI servers reject unknown types with this specific PermissionDenied
+	// response. Do not suppress actual authorization failures on supported types.
+	unsupported := status.Code(err) == codes.PermissionDenied &&
+		status.Convert(err).Message() == fmt.Sprintf("resource type %q is not supported", runtimeres.UnattendedInstallStatusType)
+	if err != nil && !cosistate.IsNotFoundError(err) && !unsupported {
+		return fmt.Errorf("reading unattended install status: %w", err)
+	}
+
+	if install != nil && install.TypedSpec().Phase != runtimeres.UnattendedInstallPhaseInstalled {
+		return fmt.Errorf("waiting for unattended install: phase is %s", install.TypedSpec().Phase)
+	}
+
+	cri, err := safe.StateGet[*serviceres.Service](ctx, c.COSI, serviceres.NewService("cri").Metadata())
+	if err != nil {
+		return fmt.Errorf("reading CRI service status: %w", err)
+	}
+
+	if spec := cri.TypedSpec(); !spec.Running || !spec.Healthy || spec.Unknown {
+		return fmt.Errorf("waiting for CRI containerd to be running and healthy")
+	}
+
+	// Neither the running stage nor overall Ready is required: finishing boot
+	// can wait for etcd, whose bootstrap depends on this resource completing.
+	return nil
+}
+
 // talosMachineUpgrade upgrades the Talos OS to the desired installer image
 // by performing: pull → install → drain → reboot → uncordon.
-func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel) (retErr error) {
+func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel, waitForKubernetes bool) (retErr error) {
 	rebootModeStr := strings.ToUpper(state.RebootMode.ValueString())
 
 	containerdInst := &commonapi.ContainerdInstance{
@@ -837,26 +903,104 @@ func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig
 		}
 	}()
 
-	if err := talosMachineReboot(ctx, endpoint, node, talosConfig, rebootModeStr); err != nil {
+	if err := talosMachineReboot(ctx, endpoint, node, talosConfig, rebootModeStr, waitForKubernetes); err != nil {
 		return fmt.Errorf("waiting for node after reboot: %w", err)
 	}
 
 	return nil
 }
 
-// talosMachineUpgradeIfNeeded checks the running Talos version and, if it differs from
-// the desired image, performs: pull → install → drain → reboot → uncordon.
+// talosMachineUpgradeIfNeeded checks the running Talos version and, for Image Factory
+// images, the active schematic. If either differs from the desired image, it performs:
+// pull → install → drain → reboot → uncordon.
 func talosMachineUpgradeIfNeeded(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel) (retErr error) {
 	runningImage, err := talosMachineRunningVersion(ctx, endpoint, node, talosConfig, state.Image.ValueString())
 	if err != nil {
 		return fmt.Errorf("reading running version: %w", err)
 	}
 
-	if runningImage == state.Image.ValueString() {
+	if runningImage != state.Image.ValueString() {
+		return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state, false)
+	}
+
+	requestedSchematic, isImageFactoryImage := talosMachineImageFactorySchematic(state.Image.ValueString())
+	if !isImageFactoryImage {
 		return nil
 	}
 
-	return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state)
+	runningSchematic, err := talosMachineRunningSchematic(ctx, endpoint, node, talosConfig)
+	if err != nil {
+		return fmt.Errorf("reading active Image Factory schematic: %w", err)
+	}
+
+	if runningSchematic == requestedSchematic {
+		return nil
+	}
+
+	return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state, false)
+}
+
+// talosMachineImageFactorySchematic returns the schematic ID embedded in the standard
+// Image Factory installer repository layout:
+// <registry>/[<platform>-]installer[-secureboot]/<schematic>:<version>.
+func talosMachineImageFactorySchematic(imageRef string) (string, bool) {
+	if strings.Contains(imageRef, "@") {
+		return "", false
+	}
+
+	repository := imageRef
+	lastSlash := strings.LastIndex(repository, "/")
+
+	if tagStart := strings.LastIndex(repository, ":"); tagStart > lastSlash {
+		repository = repository[:tagStart]
+	}
+
+	parts := strings.Split(repository, "/")
+	if len(parts) < 2 {
+		return "", false
+	}
+
+	installerRepository := parts[len(parts)-2]
+	schematicID := parts[len(parts)-1]
+	isFactoryInstaller := installerRepository == "installer" ||
+		installerRepository == "installer-secureboot" ||
+		strings.HasSuffix(installerRepository, "-installer") ||
+		strings.HasSuffix(installerRepository, "-installer-secureboot")
+
+	if schematicID == "" || !isFactoryInstaller {
+		return "", false
+	}
+
+	return schematicID, true
+}
+
+// talosMachineRunningSchematic reads the Image Factory schematic reported by Talos as
+// an ExtensionStatus pseudo-extension. A vanilla image has no such status and returns
+// an empty ID, which intentionally differs from every requested Factory schematic.
+func talosMachineRunningSchematic(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config) (string, error) {
+	var schematicID string
+
+	err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
+		items, err := safe.StateListAll[*runtimeres.ExtensionStatus](nodeCtx, c.COSI)
+		if err != nil {
+			return err
+		}
+
+		for item := range items.All() {
+			if item.TypedSpec().Metadata.Name == "schematic" {
+				schematicID = item.TypedSpec().Metadata.Version
+
+				break
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return schematicID, nil
 }
 
 func talosMachineRunningVersion(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, desiredImage string) (string, error) {
@@ -1010,13 +1154,17 @@ func kubeclientFromRaw(kubeconfigBytes []byte) (kubernetes.Interface, error) {
 	return cs, nil
 }
 
-func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, rebootModeStr string) error {
+func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, rebootModeStr string, waitForKubernetes bool) error {
 	rebootModeVal, ok := machineapi.RebootRequest_Mode_value[rebootModeStr]
 	if !ok {
 		rebootModeVal = int32(machineapi.RebootRequest_DEFAULT)
 	}
 
 	rebootMode := machineapi.RebootRequest_Mode(rebootModeVal)
+
+	if !waitForKubernetes {
+		return talosMachineRebootBeforeBootstrap(ctx, endpoint, node, talosConfig, rebootMode, talosClientOp)
+	}
 
 	return action.NewTracker(
 		newTalosClientFactory(talosConfig, endpoint, []string{node}),
@@ -1036,6 +1184,51 @@ func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig 
 		action.WithPostCheck(action.BootIDChangedPostCheckFn),
 		action.WithTimeout(15*time.Minute),
 	).Run(ctx)
+}
+
+// Create can precede etcd bootstrap, so Kubernetes readiness cannot gate its
+// reboot. Poll boot ID and CRI directly: shutdown events can be lost on reconnect.
+// Restricted roles that cannot read boot ID fall back to checking API readiness.
+func talosMachineRebootBeforeBootstrap(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, rebootMode machineapi.RebootRequest_Mode, op clientOpFunc) error {
+	preBootID, err := talosMachineBootID(ctx, endpoint, node, talosConfig, op)
+	if err != nil {
+		if status.Code(err) != codes.PermissionDenied {
+			return fmt.Errorf("reading boot ID before reboot: %w", err)
+		}
+
+		tflog.Warn(ctx, "could not read boot ID before reboot; falling back to API readiness", map[string]any{"error": err.Error()})
+	}
+
+	if err := op(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
+		return c.Reboot(nodeCtx, client.WithRebootMode(rebootMode))
+	}); err != nil {
+		return fmt.Errorf("requesting reboot: %w", err)
+	}
+
+	return retry.RetryContext(ctx, 15*time.Minute, func() *retry.RetryError {
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		if preBootID != "" {
+			bootID, err := talosMachineBootID(attemptCtx, endpoint, node, talosConfig, op)
+			switch {
+			case status.Code(err) == codes.PermissionDenied:
+				tflog.Warn(ctx, "could not read boot ID after reboot; falling back to API readiness", map[string]any{"error": err.Error()})
+
+				preBootID = ""
+			case err != nil:
+				return retry.RetryableError(err)
+			case bootID == preBootID:
+				return retry.RetryableError(errors.New("waiting for boot ID to change"))
+			}
+		}
+
+		if err := op(attemptCtx, endpoint, node, talosConfig, talosMachineCheckBootReadyOrVersion); err != nil {
+			return talosMachineBootRetryError(err)
+		}
+
+		return nil
+	})
 }
 
 // talosMachineBootID reads the node's boot ID, which the kernel regenerates on every boot.
