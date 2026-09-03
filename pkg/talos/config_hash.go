@@ -21,7 +21,7 @@ import (
 // upgrade-k8s), which sequences updates per-node with health gating.
 // talos_machine writing them in parallel would bypass that safety.
 //
-// Source: github.com/siderolabs/talos@v1.14.0-alpha.0 pkg/cluster/kubernetes/upgrade.go
+// Source: github.com/siderolabs/talos@v1.14.0 pkg/cluster/kubernetes/upgrade.go
 // If upgrade-k8s ever manages additional image fields in v1alpha1, add them here.
 var k8sImagePaths = [][]string{
 	{"machine", "kubelet", "image"},
@@ -36,7 +36,7 @@ var k8sImagePaths = [][]string{
 // fields (extraArgs, env, resources, enabled, config, …) remain in the hash so
 // talos_machine can detect user-driven drift in those documents.
 //
-// Source: github.com/siderolabs/talos@v1.14.0-rc.2 pkg/machinery/config/generate/stdpatches/stdpatches.go
+// Source: github.com/siderolabs/talos@v1.14.0 pkg/machinery/config/generate/stdpatches/stdpatches.go
 // If upgrade-k8s ever manages additional document kinds, add them here.
 //
 // KubeletConfig was added in v1.14.0-beta.0, which moved the kubelet image out

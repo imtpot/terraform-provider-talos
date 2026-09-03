@@ -13,7 +13,7 @@ pre_release = true
     [notes.updates]
         title = "Component Updates"
         description = """\
-Talos sdk: v1.14.0-rc.2
+Talos sdk: v1.14.0
 """
 
     [notes.resources]

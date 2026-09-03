@@ -77,16 +77,16 @@ func TestAccTalosMachine_bootstrap(t *testing.T) {
 // TestAccTalosMachine_drainWorkerUpgrade verifies that drain_on_upgrade = true works
 // on worker nodes when kubeconfig_wo is provided. Workers do not serve the Talos
 // kubeconfig API, so the provider must use the supplied kubeconfig to cordon and drain.
-// Uses Talos v1.13.x so the LifecycleService path (pull → install → drain → reboot →
-// uncordon) is exercised; the legacy path (< v1.13) silently skips drain.
+// Uses stable Talos releases so the LifecycleService path (pull → install → drain →
+// reboot → uncordon) is exercised; the legacy path (< v1.13) silently skips drain.
 //
 // Both versions must be stable releases: Image Factory prunes pre-release installer
 // images once the corresponding stable release ships, which silently breaks the
 // install (node stays in maintenance mode) long after the test was written.
 func TestAccTalosMachine_drainWorkerUpgrade(t *testing.T) {
 	const (
-		baseVersion    = "v1.13.0"
-		upgradeVersion = "v1.13.9"
+		baseVersion    = "v1.13.9"
+		upgradeVersion = "v1.14.0"
 	)
 
 	rName := acctest.RandStringFromCharSet(10, acctest.CharSetAlpha)
@@ -590,8 +590,8 @@ func TestAccTalosMachine_multidocK8sImagesOwned(t *testing.T) {
 		},
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
-			// Step 1: boot at alpha.1 with k8s 1.36.0; apply multi-doc config.
-			// talos_version_contract="v1.14.0-alpha.1" causes talos_machine_configuration
+			// Step 1: boot at the dep version with k8s 1.36.0; apply multi-doc config.
+			// talosVersion (= gendata.VersionTag) causes talos_machine_configuration
 			// to emit multi-doc YAML (KubeControllerManagerConfig and KubeSchedulerConfig
 			// as separate documents). Capture the stripped hash.
 			// Bootstrap is intentionally omitted: we only need the machine config applied
@@ -607,7 +607,7 @@ func TestAccTalosMachine_multidocK8sImagesOwned(t *testing.T) {
 					}),
 				),
 			},
-			// Step 2: bump kubernetes_version from 1.36.0 to 1.36.1 (Talos stays at alpha.1).
+			// Step 2: bump kubernetes_version from 1.36.0 to 1.36.1 (Talos version contract unchanged).
 			// In multi-doc format the controller-manager and scheduler image fields live in
 			// KubeControllerManagerConfig / KubeSchedulerConfig documents; stripK8sImages
 			// strips the image tag from those documents via k8sDocImageKinds, so the hash
@@ -628,17 +628,17 @@ func TestAccTalosMachine_multidocK8sImagesOwned(t *testing.T) {
 }
 
 // TestAccTalosMachine_upgradeLifecycle tests the LifecycleService upgrade path (Talos ≥ v1.13):
-// the node boots at v1.13.0 and is upgraded to v1.13.9 via ImageClient.Pull + LifecycleService.Upgrade.
+// the node boots at v1.14.0 and is upgraded via ImageClient.Pull + LifecycleService.Upgrade.
 //
-// Both versions must be stable releases: Image Factory prunes pre-release installer
-// images once the corresponding stable release ships, which silently breaks the
-// install (node stays in maintenance mode) long after the test was written.
+// Base version is the prior stable minor's latest patch: Image Factory prunes pre-release
+// installer images once the corresponding stable release ships, and older minors may
+// eventually lose assets, so pin to versions still served at the time of writing.
 //
 //nolint:dupl
 func TestAccTalosMachine_upgradeLifecycle(t *testing.T) {
 	const (
-		baseVersion    = "v1.13.0"
-		upgradeVersion = "v1.13.9"
+		baseVersion    = "v1.13.9"
+		upgradeVersion = "v1.14.0"
 	)
 
 	baseImage := images.InstallerImageRepository("metal")
@@ -654,7 +654,7 @@ func TestAccTalosMachine_upgradeLifecycle(t *testing.T) {
 		},
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
-			// Step 1: node at v1.13.0, cluster bootstrapped and healthy
+			// Step 1: node at v1.13.9, cluster bootstrapped and healthy
 			{
 				Config: testAccTalosMachineConfig(rName, baseImage, baseVersion, baseVersion),
 				Check: resource.ComposeAggregateTestCheckFunc(
@@ -664,7 +664,7 @@ func TestAccTalosMachine_upgradeLifecycle(t *testing.T) {
 					resource.TestCheckResourceAttrSet("data.talos_cluster_health.this", "id"),
 				),
 			},
-			// Step 2: upgrade to v1.13.9 via LifecycleService (new path), cluster still healthy
+			// Step 2: upgrade to v1.14.0 via LifecycleService (new path), cluster still healthy
 			{
 				Config: testAccTalosMachineConfig(rName, baseImage, upgradeVersion, baseVersion),
 				Check: resource.ComposeAggregateTestCheckFunc(
