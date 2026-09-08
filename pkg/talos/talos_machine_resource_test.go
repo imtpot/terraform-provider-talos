@@ -74,9 +74,9 @@ func TestAccTalosMachine_bootstrap(t *testing.T) {
 	})
 }
 
-// TestAccTalosMachine_bootstrapWithSchematic upgrades a node that booted from a
-// vanilla ISO to a Factory installer with the same Talos version. This exercises the
-// talos_machine Create path used by VM providers that start from a shared base image.
+// TestAccTalosMachine_bootstrapWithSchematic boots a vanilla ISO and leaves the
+// initial install image at its default. Only talos_machine.image requests the
+// non-default Factory schematic, exercising same-version reconciliation on Create.
 func TestAccTalosMachine_bootstrapWithSchematic(t *testing.T) {
 	const (
 		talosVersion = "v1.14.0"

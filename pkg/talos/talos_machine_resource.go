@@ -754,7 +754,7 @@ func (r *talosMachineResource) Delete(ctx context.Context, req resource.DeleteRe
 }
 
 // talosMachineApplyConfig applies the machine configuration with retry and waits for
-// the boot sequence and CRI to be ready afterwards (first apply can install and reboot).
+// CRI to be ready during normal boot (first apply can install and reboot).
 func talosMachineApplyConfig(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, cfgBytes []byte) error {
 	if err := retry.RetryContext(ctx, 10*time.Minute, func() *retry.RetryError {
 		if err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
@@ -778,7 +778,7 @@ func talosMachineApplyConfig(ctx context.Context, endpoint, node string, talosCo
 	}
 
 	// The API also responds during maintenance and early boot. Wait until the
-	// install/reboot has finished before reading extensions or pulling an installer.
+	// node is out of maintenance and CRI is ready before reading extensions or pulling an installer.
 	return talosMachineWaitForBoot(ctx, endpoint, node, talosConfig, talosClientOp)
 }
 
@@ -805,8 +805,8 @@ func talosMachineCheckBootReady(ctx context.Context, c *client.Client) error {
 		return fmt.Errorf("reading machine boot status: %w", err)
 	}
 
-	if stage := machine.TypedSpec().Stage; stage != runtimeres.MachineStageRunning {
-		return fmt.Errorf("waiting for boot sequence to finish: stage is %s", stage)
+	if stage := machine.TypedSpec().Stage; stage != runtimeres.MachineStageBooting && stage != runtimeres.MachineStageRunning {
+		return fmt.Errorf("waiting for normal boot: stage is %s", stage)
 	}
 
 	cri, err := safe.StateGet[*serviceres.Service](ctx, c.COSI, serviceres.NewService("cri").Metadata())
@@ -818,8 +818,8 @@ func talosMachineCheckBootReady(ctx context.Context, c *client.Client) error {
 		return fmt.Errorf("waiting for CRI containerd to be running and healthy")
 	}
 
-	// Do not require MachineStatus.Status.Ready: etcd/Kubernetes bootstrap can
-	// depend on this resource completing, and has not necessarily happened yet.
+	// Neither the running stage nor overall Ready is required: finishing boot
+	// can wait for etcd, whose bootstrap depends on this resource completing.
 	return nil
 }
 
