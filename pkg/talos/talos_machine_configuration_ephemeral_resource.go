@@ -90,9 +90,15 @@ func (r *talosMachineConfigurationEphemeralResource) Schema(_ context.Context, _
 				Computed: true,
 			},
 			"talos_version": schema.StringAttribute{
-				Description: "The Talos version contract used to generate the machine configuration. This does not control the installed Talos version. Use `config_patches` to set `machine.install.image` to the desired value. Example values: `v1.12`, `v1.12.1`, `1.12`, `1.12.1`", // nolint:lll
-				Optional:    true,
-				Computed:    true,
+				Description: "The Talos version contract used to generate the machine configuration. " +
+					"This does not control the installed Talos version — use `config_patches` to set `machine.install.image` for that. " +
+					"Keep this pinned to the version used when the cluster was created; it is independent of `talos_machine.image`, " +
+					"and regular Talos upgrades do not require bumping it. Only change it when you deliberately want a newer " +
+					"contract's schema and defaults, which regenerates the machine configuration on its own. " +
+					"See [Reproducible Machine Configuration](https://docs.siderolabs.com/talos/latest/configure-your-talos-cluster/system-configuration/reproducible-machine-configuration) " +
+					"for details. Example values: `v1.12`, `v1.12.1`, `1.12`, `1.12.1`",
+				Optional: true,
+				Computed: true,
 				Validators: []validator.String{
 					talosVersionValid(),
 				},

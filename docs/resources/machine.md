@@ -49,17 +49,17 @@ resource "talos_machine_bootstrap" "this" {
 
 ## Upgrade example
 
-Change `image` (and `talos_version` in the data source) to trigger an in-place OS upgrade:
+Change `image` to trigger an in-place OS upgrade. Leave `talos_version` in the data source untouched: it is the config-generation contract pinned to the version the cluster was created with, not the installed Talos version, and it is independent of `image` — bumping it regenerates the machine configuration and is a separate, deliberate action, not something you do on every OS upgrade:
 
 ```terraform
 data "talos_machine_configuration" "this" {
   # ...
-  talos_version = "v1.10.0"
+  talos_version = "v1.10.0" # pinned to the version used to create the cluster; do not bump on every upgrade
 }
 
 resource "talos_machine" "this" {
   # ...
-  image = "ghcr.io/siderolabs/installer:v1.10.0"
+  image = "ghcr.io/siderolabs/installer:v1.11.0"
 }
 ```
 
