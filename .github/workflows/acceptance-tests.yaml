@@ -11,7 +11,7 @@ jobs:
   acc-tests:
     if: github.repository == 'imtpot/terraform-provider-talos'
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 75
     env:
       GOTOOLCHAIN: local
     steps:
@@ -84,6 +84,4 @@ jobs:
           LIBVIRT_DEFAULT_URI: qemu:///system
           CI: "true"
         run: |
-          TF_CLI_CONFIG_FILE=thisfiledoesnotexist TF_ACC=1 go test -v \
-            -run '^TestAccTalosMachine_bootstrapWithSchematic$' \
-            -parallel=1 -count=1 -timeout=25m -exec='sudo -E' ./pkg/talos
+          make testacc
