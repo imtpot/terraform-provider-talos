@@ -813,7 +813,11 @@ func talosMachineCheckBootReady(ctx context.Context, c *client.Client) error {
 	// Talos 1.14 keeps this status at waiting-for-reboot until the first
 	// install's reboot has actually happened. Older Talos has no such resource.
 	install, err := safe.StateGet[*runtimeres.UnattendedInstallStatus](ctx, c.COSI, runtimeres.NewUnattendedInstallStatus().Metadata())
-	if err != nil && !cosistate.IsNotFoundError(err) {
+	// Older COSI servers reject unknown types with this specific PermissionDenied
+	// response. Do not suppress actual authorization failures on supported types.
+	unsupported := status.Code(err) == codes.PermissionDenied &&
+		status.Convert(err).Message() == fmt.Sprintf("resource type %q is not supported", runtimeres.UnattendedInstallStatusType)
+	if err != nil && !cosistate.IsNotFoundError(err) && !unsupported {
 		return fmt.Errorf("reading unattended install status: %w", err)
 	}
 

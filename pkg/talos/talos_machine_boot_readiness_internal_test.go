@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
@@ -128,6 +129,57 @@ func TestTalosMachineBootReadinessWaitsForUnattendedInstall(t *testing.T) {
 				require.NoError(t, err)
 			} else {
 				require.Error(t, err, "must not race an unfinished first install or its scheduled reboot")
+			}
+		})
+	}
+}
+
+type bootTestUnsupportedState struct {
+	state.State
+	err error
+}
+
+func (s bootTestUnsupportedState) Get(ctx context.Context, ptr resource.Pointer, opts ...state.GetOption) (resource.Resource, error) {
+	if ptr.Type() == runtimeres.UnattendedInstallStatusType {
+		return nil, s.err
+	}
+
+	return s.State.Get(ctx, ptr, opts...)
+}
+
+func TestTalosMachineBootReadinessOlderTalos(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		err   error
+		name  string
+		ready bool
+	}{
+		{
+			name:  "old server has no unattended install resource type",
+			err:   status.Errorf(codes.PermissionDenied, "resource type %q is not supported", runtimeres.UnattendedInstallStatusType),
+			ready: true,
+		},
+		{
+			name: "actual permission denial must not be ignored",
+			err:  status.Error(codes.PermissionDenied, "not authorized to read this resource"),
+		},
+		{
+			name: "other server errors must not be ignored",
+			err:  status.Errorf(codes.Unknown, "resource type %q is not supported", runtimeres.UnattendedInstallStatusType),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := bootTestClient(t, runtimeres.MachineStageBooting, true, true)
+			c.COSI = bootTestUnsupportedState{State: c.COSI, err: tt.err}
+
+			err := talosMachineCheckBootReady(t.Context(), c)
+			if tt.ready {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tt.err)
 			}
 		})
 	}
