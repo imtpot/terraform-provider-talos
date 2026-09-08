@@ -83,4 +83,7 @@ jobs:
           TERRAFORM_LIBVIRT_TEST_DOMAIN_TYPE: kvm
           LIBVIRT_DEFAULT_URI: qemu:///system
           CI: "true"
-        run: make testacc
+        run: |
+          TF_CLI_CONFIG_FILE=thisfiledoesnotexist TF_ACC=1 go test -v \
+            -run '^TestAccTalos(Cluster_bootstrapHA|Machine_bootstrapWithSchematic|Machine_bootstrapWithWriteOnlyClientConfig)$' \
+            -parallel=4 -count=2 -timeout=60m -exec='sudo -E' ./pkg/talos

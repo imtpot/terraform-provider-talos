@@ -1142,16 +1142,13 @@ func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig 
 
 	rebootMode := machineapi.RebootRequest_Mode(rebootModeVal)
 
-	expectedEvent := action.MachineReadyEventFn
 	if !waitForKubernetes {
-		// Create can precede etcd bootstrap. Observe shutdown, then prove a new
-		// boot via BootIDChangedPostCheckFn before waiting for CRI below.
-		expectedEvent = action.StopAllServicesEventFn
+		return talosMachineRebootBeforeBootstrap(ctx, endpoint, node, talosConfig, rebootMode, talosClientOp)
 	}
 
-	if err := action.NewTracker(
+	return action.NewTracker(
 		newTalosClientFactory(talosConfig, endpoint, []string{node}),
-		expectedEvent,
+		action.MachineReadyEventFn,
 		func(rebootCtx context.Context, c *client.Client) (string, error) {
 			resp, err := c.RebootWithResponse(rebootCtx, client.WithRebootMode(rebootMode))
 			if err != nil {
@@ -1166,15 +1163,42 @@ func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig 
 		},
 		action.WithPostCheck(action.BootIDChangedPostCheckFn),
 		action.WithTimeout(15*time.Minute),
-	).Run(ctx); err != nil {
-		return err
+	).Run(ctx)
+}
+
+// Create can precede etcd bootstrap, so Kubernetes readiness cannot gate its
+// reboot. Poll boot ID and CRI directly: shutdown events can be lost on reconnect.
+func talosMachineRebootBeforeBootstrap(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, rebootMode machineapi.RebootRequest_Mode, op clientOpFunc) error {
+	preBootID, err := talosMachineBootID(ctx, endpoint, node, talosConfig, op)
+	if err != nil {
+		return fmt.Errorf("reading boot ID before reboot: %w", err)
 	}
 
-	if !waitForKubernetes {
-		return talosMachineWaitForBoot(ctx, endpoint, node, talosConfig, talosClientOp)
+	if err := op(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
+		return c.Reboot(nodeCtx, client.WithRebootMode(rebootMode))
+	}); err != nil {
+		return fmt.Errorf("requesting reboot: %w", err)
 	}
 
-	return nil
+	return retry.RetryContext(ctx, 15*time.Minute, func() *retry.RetryError {
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		bootID, err := talosMachineBootID(attemptCtx, endpoint, node, talosConfig, op)
+		if err != nil {
+			return retry.RetryableError(err)
+		}
+
+		if bootID == preBootID {
+			return retry.RetryableError(errors.New("waiting for boot ID to change"))
+		}
+
+		if err := op(attemptCtx, endpoint, node, talosConfig, talosMachineCheckBootReady); err != nil {
+			return retry.RetryableError(err)
+		}
+
+		return nil
+	})
 }
 
 // talosMachineBootID reads the node's boot ID, which the kernel regenerates on every boot.
