@@ -1,23 +1,30 @@
-name: acceptance-tests
+name: fork-acceptance-diagnostic
 concurrency:
   group: ${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 on:
-  pull_request:
-    paths:
-      - 'go.mod'
-      - 'go.sum'
-      - '**.go'
+  push:
+    branches: [debug/acc-pr397]
+permissions:
+  contents: read
 jobs:
   acc-tests:
-    if: (!startsWith(github.head_ref, 'renovate/') && !startsWith(github.head_ref, 'dependabot/'))
-    runs-on:
-      group: large
+    if: github.repository == 'imtpot/terraform-provider-talos'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     env:
       GOTOOLCHAIN: local
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Verify KVM
+        run: |
+          test -c /dev/kvm
+          sudo test -r /dev/kvm
+          sudo test -w /dev/kvm
+          nproc
+          free -h
+          df -h /
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -41,18 +48,16 @@ jobs:
             qemu-system-x86 \
             ovmf
 
-          sudo ln -s OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd
-          sudo ln -s OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd
+          sudo ln -sf OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd
+          sudo ln -sf OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd
 
-          sudo virtlockd -d
-          sudo virtlogd -d
-          sudo libvirtd -d
+          echo 'security_driver = "none"' | sudo tee --append /etc/libvirt/qemu.conf
+          sudo systemctl restart libvirtd
           echo -e "<pool type='dir'>\n<name>default</name>\n<target>\n<path>/pool-default</path>\n</target>\n</pool>" > pool.xml
           sudo mkdir /pool-default
           sudo chmod a+rwx /pool-default
           sudo virsh pool-define pool.xml
           sudo virsh pool-start default
-          echo 'security_driver = "none"' | sudo tee --append /etc/libvirt/qemu.conf
           cat <<EOF > net.xml
           <network>
             <name>default</name>
@@ -66,8 +71,8 @@ jobs:
             </ip>
           </network>
           EOF
-          sudo virsh net-destroy default
-          sudo virsh net-undefine default
+          sudo virsh net-destroy default || true
+          sudo virsh net-undefine default || true
           sudo virsh net-create net.xml
       - name: Runner info
         run: nproc && free -h
@@ -79,4 +84,6 @@ jobs:
           LIBVIRT_DEFAULT_URI: qemu:///system
           CI: "true"
         run: |
-          make testacc
+          TF_CLI_CONFIG_FILE=thisfiledoesnotexist TF_ACC=1 go test -v \
+            -run '^TestAccTalosMachine_bootstrapWithSchematic$' \
+            -parallel=1 -count=1 -timeout=25m -exec='sudo -E' ./pkg/talos
