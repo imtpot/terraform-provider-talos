@@ -106,6 +106,33 @@ func TestTalosMachineBootWaitSurvivesReboot(t *testing.T) {
 	require.Equal(t, 3, calls, "must wait past the first API response after reboot")
 }
 
+func TestTalosMachineBootReadinessWaitsForUnattendedInstall(t *testing.T) {
+	t.Parallel()
+
+	for _, phase := range []runtimeres.UnattendedInstallPhase{
+		runtimeres.UnattendedInstallPhasePending,
+		runtimeres.UnattendedInstallPhaseInstalling,
+		runtimeres.UnattendedInstallPhaseWaitingForReboot,
+		runtimeres.UnattendedInstallPhaseInstalled,
+	} {
+		t.Run(phase.String(), func(t *testing.T) {
+			t.Parallel()
+
+			c := bootTestClient(t, runtimeres.MachineStageBooting, true, true)
+			install := runtimeres.NewUnattendedInstallStatus()
+			install.TypedSpec().Phase = phase
+			require.NoError(t, c.COSI.Create(t.Context(), install))
+
+			err := talosMachineCheckBootReady(t.Context(), c)
+			if phase == runtimeres.UnattendedInstallPhaseInstalled {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err, "must not race an unfinished first install or its scheduled reboot")
+			}
+		})
+	}
+}
+
 func TestTalosMachineBootWaitRejectsInvalidCredentials(t *testing.T) {
 	t.Parallel()
 

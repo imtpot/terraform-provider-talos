@@ -14,6 +14,7 @@ import (
 
 	cosiresource "github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/safe"
+	cosistate "github.com/cosi-project/runtime/pkg/state"
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -807,6 +808,17 @@ func talosMachineCheckBootReady(ctx context.Context, c *client.Client) error {
 
 	if stage := machine.TypedSpec().Stage; stage != runtimeres.MachineStageBooting && stage != runtimeres.MachineStageRunning {
 		return fmt.Errorf("waiting for normal boot: stage is %s", stage)
+	}
+
+	// Talos 1.14 keeps this status at waiting-for-reboot until the first
+	// install's reboot has actually happened. Older Talos has no such resource.
+	install, err := safe.StateGet[*runtimeres.UnattendedInstallStatus](ctx, c.COSI, runtimeres.NewUnattendedInstallStatus().Metadata())
+	if err != nil && !cosistate.IsNotFoundError(err) {
+		return fmt.Errorf("reading unattended install status: %w", err)
+	}
+
+	if install != nil && install.TypedSpec().Phase != runtimeres.UnattendedInstallPhaseInstalled {
+		return fmt.Errorf("waiting for unattended install: phase is %s", install.TypedSpec().Phase)
 	}
 
 	cri, err := safe.StateGet[*serviceres.Service](ctx, c.COSI, serviceres.NewService("cri").Metadata())
