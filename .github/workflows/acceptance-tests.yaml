@@ -84,4 +84,6 @@ jobs:
           LIBVIRT_DEFAULT_URI: qemu:///system
           CI: "true"
         run: |
-          make testacc
+          TF_CLI_CONFIG_FILE=thisfiledoesnotexist TF_ACC=1 go test -v \
+            -run '^TestAccTalosCluster_bootstrapHA$' \
+            -parallel=4 -count=3 -timeout=60m -exec='sudo -E' ./pkg/talos

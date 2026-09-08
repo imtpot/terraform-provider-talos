@@ -849,6 +849,14 @@ func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig
 // images, the active schematic. If either differs from the desired image, it performs:
 // pull → install → drain → reboot → uncordon.
 func talosMachineUpgradeIfNeeded(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel) (retErr error) {
+	before := talosMachineDebugBoot(ctx, endpoint, node, talosConfig)
+	defer func() {
+		if retErr != nil {
+			retErr = fmt.Errorf("%w; [DEBUG-pr397] before=%s after=%s", retErr, before,
+				talosMachineDebugBoot(ctx, endpoint, node, talosConfig))
+		}
+	}()
+
 	runningImage, err := talosMachineRunningVersion(ctx, endpoint, node, talosConfig, state.Image.ValueString())
 	if err != nil {
 		return fmt.Errorf("reading running version: %w", err)
@@ -936,6 +944,41 @@ func talosMachineRunningSchematic(ctx context.Context, endpoint, node string, ta
 	}
 
 	return schematicID, nil
+}
+
+func talosMachineDebugBoot(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config) string {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var fields []string
+	err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
+		machine, err := safe.StateGet[*runtimeres.MachineStatus](nodeCtx, c.COSI,
+			runtimeres.NewMachineStatus().Metadata())
+		if err != nil {
+			return err
+		}
+
+		fields = append(fields, "stage="+machine.TypedSpec().Stage.String())
+		services, err := c.ServiceList(nodeCtx)
+		if err != nil {
+			return err
+		}
+
+		for _, message := range services.Messages {
+			for _, svc := range message.Services {
+				if svc.Id == "cri" || svc.Id == "containerd" {
+					fields = append(fields, fmt.Sprintf("%s=%s/healthy:%t", svc.Id, svc.State, svc.Health.GetHealthy()))
+				}
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		fields = append(fields, fmt.Sprintf("error=%v", err))
+	}
+
+	return strings.Join(fields, ",")
 }
 
 func talosMachineRunningVersion(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, desiredImage string) (string, error) {
