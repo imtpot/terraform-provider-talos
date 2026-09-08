@@ -849,11 +849,14 @@ func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig
 // images, the active schematic. If either differs from the desired image, it performs:
 // pull → install → drain → reboot → uncordon.
 func talosMachineUpgradeIfNeeded(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel) (retErr error) {
-	before := talosMachineDebugBoot(ctx, endpoint, node, talosConfig)
 	defer func() {
 		if retErr != nil {
-			retErr = fmt.Errorf("%w; [DEBUG-pr397] before=%s after=%s", retErr, before,
-				talosMachineDebugBoot(ctx, endpoint, node, talosConfig))
+			var samples []string
+			for range 5 {
+				samples = append(samples, talosMachineDebugBoot(ctx, endpoint, node, talosConfig))
+				time.Sleep(2 * time.Second)
+			}
+			retErr = fmt.Errorf("%w; [DEBUG-pr397] recovery=%s", retErr, strings.Join(samples, "; "))
 		}
 	}()
 
@@ -959,6 +962,11 @@ func talosMachineDebugBoot(ctx context.Context, endpoint, node string, talosConf
 		}
 
 		fields = append(fields, "stage="+machine.TypedSpec().Stage.String())
+		install, installErr := safe.StateGet[*runtimeres.UnattendedInstallStatus](nodeCtx, c.COSI,
+			runtimeres.NewUnattendedInstallStatus().Metadata())
+		if installErr == nil {
+			fields = append(fields, "install="+install.TypedSpec().Phase.String())
+		}
 		services, err := c.ServiceList(nodeCtx)
 		if err != nil {
 			return err
