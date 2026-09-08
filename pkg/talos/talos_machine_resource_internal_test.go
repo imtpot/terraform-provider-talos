@@ -16,6 +16,10 @@ import (
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 )
 
+// testDigest is a fixture SHA-256 digest reused by tests covering digest-pinned
+// image references.
+const testDigest = "sha256:b9a485250c4d1a3f6d3b1c1b0a1f6a1c1e1a1b1c1d1e1f1a1b1c1d1e1f1a1b1c"
+
 // TestLegacyUpgrade_ImmediateRPCError_AbortsPollEarly calls the real
 // talosMachineUpgradeLegacy with a mock op that returns an error immediately.
 // It verifies the function returns well within the 5-second context deadline
@@ -49,5 +53,97 @@ func TestLegacyUpgrade_ImmediateRPCError_AbortsPollEarly(t *testing.T) {
 	// path. Its presence proves the goroutine error reached the poll loop.
 	if !strings.Contains(err.Error(), "upgrade RPC failed:") {
 		t.Fatalf("expected 'upgrade RPC failed:' in error message, got: %v", err)
+	}
+}
+
+// TestReplaceImageTag is the red-phase test for
+// https://github.com/siderolabs/terraform-provider-talos/issues/393: for a
+// digest-pinned reference, replacing everything after the last ':' also eats
+// into the "sha256:<hex>" digest, producing a corrupted reference such as
+// "repo@sha256:v1.13.9". That corrupted value gets written back into
+// talos_machine's state on every Read (and compared against the desired image
+// on every Update), so digest-pinned images never reach a stable plan.
+func TestReplaceImageTag(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		imageRef string
+		newTag   string
+		want     string
+	}{
+		"tag reference": {
+			imageRef: "ghcr.io/siderolabs/installer:v1.13.0",
+			newTag:   "v1.13.9",
+			want:     "ghcr.io/siderolabs/installer:v1.13.9",
+		},
+		"no tag": {
+			imageRef: "ghcr.io/siderolabs/installer",
+			newTag:   "v1.13.9",
+			want:     "ghcr.io/siderolabs/installer:v1.13.9",
+		},
+		"digest reference is left untouched": {
+			imageRef: "ghcr.io/siderolabs/installer@" + testDigest,
+			newTag:   "v1.13.9",
+			want:     "ghcr.io/siderolabs/installer@" + testDigest,
+		},
+		"registry host:port with no tag": {
+			imageRef: "registry.example.com:5000/siderolabs/installer",
+			newTag:   "v1.13.9",
+			want:     "registry.example.com:5000/siderolabs/installer:v1.13.9",
+		},
+		"registry host:port with a tag": {
+			imageRef: "registry.example.com:5000/siderolabs/installer:v1.13.0",
+			newTag:   "v1.13.9",
+			want:     "registry.example.com:5000/siderolabs/installer:v1.13.9",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := replaceImageTag(test.imageRef, test.newTag); got != test.want {
+				t.Fatalf("replaceImageTag(%q, %q) = %q, want %q", test.imageRef, test.newTag, got, test.want)
+			}
+		})
+	}
+}
+
+// TestTalosMachineReconcileRunningImage is the red-phase test for the Create-time
+// regression the naive digest fix introduced: if a digest-pinned desiredImage were
+// compared using replaceImageTag directly, it would always equal desiredImage
+// itself, so talosMachineUpgradeIfNeeded would conclude the node already runs the
+// desired image and skip installing it — even on a freshly provisioned node that
+// has never run it. talosMachineReconcileRunningImage must return "" for digest
+// pins so the caller always installs instead.
+func TestTalosMachineReconcileRunningImage(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		desiredImage string
+		reportedTag  string
+		want         string
+	}{
+		"tag reference reflects the reported version": {
+			desiredImage: "ghcr.io/siderolabs/installer:v1.13.0",
+			reportedTag:  "v1.13.9",
+			want:         "ghcr.io/siderolabs/installer:v1.13.9",
+		},
+		"digest reference never matches, forcing install": {
+			desiredImage: "ghcr.io/siderolabs/installer@" + testDigest,
+			reportedTag:  "v1.13.9",
+			want:         "",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := talosMachineReconcileRunningImage(test.desiredImage, test.reportedTag); got != test.want {
+				t.Fatalf("talosMachineReconcileRunningImage(%q, %q) = %q, want %q",
+					test.desiredImage, test.reportedTag, got, test.want)
+			}
+		})
 	}
 }

@@ -871,7 +871,7 @@ func talosMachineRunningVersion(ctx context.Context, endpoint, node string, talo
 			}
 
 			for _, msg := range versionResp.Messages {
-				runningImage = replaceImageTag(desiredImage, msg.Version.Tag)
+				runningImage = talosMachineReconcileRunningImage(desiredImage, msg.Version.Tag)
 
 				break
 			}
@@ -1159,12 +1159,36 @@ func talosMachineUpgradeLegacy(ctx context.Context, endpoint, node string, talos
 
 // replaceImageTag replaces the tag portion of an image reference.
 // "ghcr.io/siderolabs/installer:v1.8.0" + "v1.9.0" → "ghcr.io/siderolabs/installer:v1.9.0".
+// Digest-pinned references ("repo@sha256:<hex>") already fully identify the image and
+// have no tag component to replace, so they are returned unchanged — otherwise the
+// last ':' found belongs to the digest's "sha256:" prefix, corrupting it.
 func replaceImageTag(imageRef, newTag string) string {
-	if idx := strings.LastIndex(imageRef, ":"); idx != -1 {
+	if isDigestPinnedImage(imageRef) {
+		return imageRef
+	}
+
+	// The tag separator is only the last ':' if it comes after the last '/' —
+	// otherwise it's a registry host:port, e.g. "registry.example.com:5000/repo".
+	if idx := strings.LastIndex(imageRef, ":"); idx > strings.LastIndex(imageRef, "/") {
 		return imageRef[:idx+1] + newTag
 	}
 
 	return imageRef + ":" + newTag
+}
+
+// talosMachineReconcileRunningImage returns the image reference to compare against
+// desiredImage when deciding whether a node already runs the desired install, given
+// the version tag reported by that node. Digest-pinned images have no tag component
+// to compare against the reported version, so there is no reliable way to tell
+// whether the node already runs the desired image. Returning "" guarantees it never
+// matches desiredImage, so the caller installs it rather than silently skipping a
+// node that was never actually reconciled.
+func talosMachineReconcileRunningImage(desiredImage, reportedTag string) string {
+	if isDigestPinnedImage(desiredImage) {
+		return ""
+	}
+
+	return replaceImageTag(desiredImage, reportedTag)
 }
 
 // resolveTalosMachineClientConfig builds the Talos client config from either the

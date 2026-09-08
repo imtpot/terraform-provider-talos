@@ -800,3 +800,11 @@ func (v ipAddressValidator) Description(_ context.Context) string {
 func (v ipAddressValidator) MarkdownDescription(ctx context.Context) string {
 	return v.Description(ctx)
 }
+
+// isDigestPinnedImage reports whether an OCI image reference is pinned by digest
+// (e.g. "repo@sha256:<hex>") rather than by tag. Digest references fully identify
+// the image on their own, so callers should not try to extract or replace a tag
+// component from one.
+func isDigestPinnedImage(imageRef string) bool {
+	return strings.Contains(imageRef, "@")
+}

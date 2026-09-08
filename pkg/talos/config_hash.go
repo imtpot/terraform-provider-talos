@@ -198,7 +198,16 @@ func stripTagAtYAMLPath(m map[string]any, keys ...string) {
 //	"ghcr.io/siderolabs/kubelet:v1.35.4"      → "ghcr.io/siderolabs/kubelet"
 //	"my-reg.example.com:5000/kubelet:v1.35.4"  → "my-reg.example.com:5000/kubelet"
 //	"ghcr.io/siderolabs/kubelet"               → "ghcr.io/siderolabs/kubelet"
+//	"ghcr.io/siderolabs/kubelet@sha256:<hex>"  → "ghcr.io/siderolabs/kubelet@sha256:<hex>"
+//
+// Digest-pinned references are returned unchanged: unlike a tag, the digest is
+// the content identity itself, not a separately-bumped version label, so a
+// digest change must still register as a hash change.
 func stripImageTag(image string) string {
+	if isDigestPinnedImage(image) {
+		return image
+	}
+
 	i := strings.LastIndex(image, ":")
 	if i < 0 {
 		return image
