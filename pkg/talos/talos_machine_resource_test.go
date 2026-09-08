@@ -87,7 +87,13 @@ func TestAccTalosMachine_bootstrapWithSchematic(t *testing.T) {
 
 	// Register the schematic with Factory before the node pulls its installer.
 	config := testAccTalosMachineConfigWithoutInstallImage(rName, factoryImage, talosVersion, talosVersion) + `
-resource "talos_image_factory_schematic" "this" {}
+resource "talos_image_factory_schematic" "this" {
+  schematic = yamlencode({
+    customization = {
+      extraKernelArgs = ["console=ttyS0"]
+    }
+  })
+}
 `
 
 	resource.ParallelTest(t, resource.TestCase{
@@ -106,6 +112,10 @@ resource "talos_image_factory_schematic" "this" {}
 						schematic, ok := s.RootModule().Resources["talos_image_factory_schematic.this"]
 						if !ok || schematic.Primary == nil || schematic.Primary.ID == "" {
 							return fmt.Errorf("factory schematic is missing from state")
+						}
+
+						if schematic.Primary.ID == images.DefaultInstallerImageSchematic {
+							return fmt.Errorf("test schematic must differ from the initial installer schematic")
 						}
 
 						return checkNodeSchematic("talos_machine.this", schematic.Primary.ID)(s)

@@ -37,6 +37,7 @@ import (
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	configresource "github.com/siderolabs/talos/pkg/machinery/resources/config"
 	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
+	serviceres "github.com/siderolabs/talos/pkg/machinery/resources/v1alpha1"
 	talosreporter "github.com/siderolabs/talos/pkg/reporter"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -753,7 +754,7 @@ func (r *talosMachineResource) Delete(ctx context.Context, req resource.DeleteRe
 }
 
 // talosMachineApplyConfig applies the machine configuration with retry and waits for
-// the node to be reachable afterwards (it reboots on first config apply).
+// the boot sequence and CRI to be ready afterwards (first apply can install and reboot).
 func talosMachineApplyConfig(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, cfgBytes []byte) error {
 	if err := retry.RetryContext(ctx, 10*time.Minute, func() *retry.RetryError {
 		if err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
@@ -776,18 +777,50 @@ func talosMachineApplyConfig(ctx context.Context, endpoint, node string, talosCo
 		return fmt.Errorf("applying configuration: %w", err)
 	}
 
-	// Poll until node is back up — it may have rebooted after first config apply.
-	return retry.RetryContext(ctx, 10*time.Minute, func() *retry.RetryError {
-		if err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
-			_, err := c.Version(nodeCtx)
+	// The API also responds during maintenance and early boot. Wait until the
+	// install/reboot has finished before reading extensions or pulling an installer.
+	return talosMachineWaitForBoot(ctx, endpoint, node, talosConfig, talosClientOp)
+}
 
-			return err
-		}); err != nil {
+func talosMachineWaitForBoot(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, op clientOpFunc) error {
+	return retry.RetryContext(ctx, 10*time.Minute, func() *retry.RetryError {
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		if err := op(attemptCtx, endpoint, node, talosConfig, talosMachineCheckBootReady); err != nil {
+			if code := status.Code(err); code == codes.PermissionDenied || code == codes.Unauthenticated || code == codes.InvalidArgument {
+				return retry.NonRetryableError(err)
+			}
+
 			return retry.RetryableError(err)
 		}
 
 		return nil
 	})
+}
+
+func talosMachineCheckBootReady(ctx context.Context, c *client.Client) error {
+	machine, err := safe.StateGet[*runtimeres.MachineStatus](ctx, c.COSI, runtimeres.NewMachineStatus().Metadata())
+	if err != nil {
+		return fmt.Errorf("reading machine boot status: %w", err)
+	}
+
+	if stage := machine.TypedSpec().Stage; stage != runtimeres.MachineStageRunning {
+		return fmt.Errorf("waiting for boot sequence to finish: stage is %s", stage)
+	}
+
+	cri, err := safe.StateGet[*serviceres.Service](ctx, c.COSI, serviceres.NewService("cri").Metadata())
+	if err != nil {
+		return fmt.Errorf("reading CRI service status: %w", err)
+	}
+
+	if spec := cri.TypedSpec(); !spec.Running || !spec.Healthy || spec.Unknown {
+		return fmt.Errorf("waiting for CRI containerd to be running and healthy")
+	}
+
+	// Do not require MachineStatus.Status.Ready: etcd/Kubernetes bootstrap can
+	// depend on this resource completing, and has not necessarily happened yet.
+	return nil
 }
 
 // talosMachineUpgrade upgrades the Talos OS to the desired installer image
@@ -849,17 +882,6 @@ func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig
 // images, the active schematic. If either differs from the desired image, it performs:
 // pull → install → drain → reboot → uncordon.
 func talosMachineUpgradeIfNeeded(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel) (retErr error) {
-	defer func() {
-		if retErr != nil {
-			var samples []string
-			for range 5 {
-				samples = append(samples, talosMachineDebugBoot(ctx, endpoint, node, talosConfig))
-				time.Sleep(2 * time.Second)
-			}
-			retErr = fmt.Errorf("%w; [DEBUG-pr397] recovery=%s", retErr, strings.Join(samples, "; "))
-		}
-	}()
-
 	runningImage, err := talosMachineRunningVersion(ctx, endpoint, node, talosConfig, state.Image.ValueString())
 	if err != nil {
 		return fmt.Errorf("reading running version: %w", err)
@@ -947,46 +969,6 @@ func talosMachineRunningSchematic(ctx context.Context, endpoint, node string, ta
 	}
 
 	return schematicID, nil
-}
-
-func talosMachineDebugBoot(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config) string {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	var fields []string
-	err := talosClientOp(ctx, endpoint, node, talosConfig, func(nodeCtx context.Context, c *client.Client) error {
-		machine, err := safe.StateGet[*runtimeres.MachineStatus](nodeCtx, c.COSI,
-			runtimeres.NewMachineStatus().Metadata())
-		if err != nil {
-			return err
-		}
-
-		fields = append(fields, "stage="+machine.TypedSpec().Stage.String())
-		install, installErr := safe.StateGet[*runtimeres.UnattendedInstallStatus](nodeCtx, c.COSI,
-			runtimeres.NewUnattendedInstallStatus().Metadata())
-		if installErr == nil {
-			fields = append(fields, "install="+install.TypedSpec().Phase.String())
-		}
-		services, err := c.ServiceList(nodeCtx)
-		if err != nil {
-			return err
-		}
-
-		for _, message := range services.Messages {
-			for _, svc := range message.Services {
-				if svc.Id == "cri" || svc.Id == "containerd" {
-					fields = append(fields, fmt.Sprintf("%s=%s/healthy:%t", svc.Id, svc.State, svc.Health.GetHealthy()))
-				}
-			}
-		}
-
-		return nil
-	})
-	if err != nil {
-		fields = append(fields, fmt.Sprintf("error=%v", err))
-	}
-
-	return strings.Join(fields, ",")
 }
 
 func talosMachineRunningVersion(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, desiredImage string) (string, error) {
