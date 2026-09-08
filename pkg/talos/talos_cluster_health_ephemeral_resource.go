@@ -7,7 +7,6 @@ package talos
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
@@ -17,7 +16,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/siderolabs/talos/pkg/cluster"
 	"github.com/siderolabs/talos/pkg/cluster/check"
-	"github.com/siderolabs/talos/pkg/conditions"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 )
 
@@ -32,28 +30,6 @@ type talosClusterHealthEphemeralResourceModel struct {
 	WorkerNodes          types.List          `tfsdk:"worker_nodes"`
 	Timeout              types.String        `tfsdk:"timeout"`
 	SkipKubernetesChecks types.Bool          `tfsdk:"skip_kubernetes_checks"`
-}
-
-type healthReporter struct {
-	lastLine string
-	s        strings.Builder
-}
-
-func newHealthReporter() *healthReporter {
-	return &healthReporter{}
-}
-
-// Update implements the conditions.Reporter interface.
-func (r *healthReporter) Update(condition conditions.Condition) {
-	if condition.String() != r.lastLine {
-		fmt.Fprintf(&r.s, "waiting for %s\n", condition.String())
-		r.lastLine = condition.String()
-	}
-}
-
-// String returns the string representation of the reporter.
-func (r *healthReporter) String() string {
-	return r.s.String()
 }
 
 // NewTalosClusterHealthEphemeralResource implements the ephemeral.EphemeralResource interface.
@@ -218,7 +194,7 @@ func (r *talosClusterHealthEphemeralResource) Open(ctx context.Context, req ephe
 	checkCtx, checkCtxCancel := context.WithTimeout(ctx, timeout)
 	defer checkCtxCancel()
 
-	reporter := newHealthReporter()
+	progress := newReporter()
 
 	checks := check.PreBootSequenceChecks()
 
@@ -226,8 +202,11 @@ func (r *talosClusterHealthEphemeralResource) Open(ctx context.Context, req ephe
 		checks = check.DefaultClusterChecks()
 	}
 
-	if err := check.Wait(checkCtx, &clusterState, checks, reporter); err != nil {
-		resp.Diagnostics.AddWarning("failed checks", reporter.String())
+	if err := check.Wait(checkCtx, &clusterState, checks, progress); err != nil {
+		if s := progress.String(); s != "" {
+			resp.Diagnostics.AddWarning("failed checks", s)
+		}
+
 		resp.Diagnostics.AddError("cluster health check failed", err.Error())
 
 		return

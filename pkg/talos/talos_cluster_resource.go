@@ -295,7 +295,13 @@ func (r *talosClusterResource) Create(ctx context.Context, req resource.CreateRe
 		return
 	}
 
-	if err = talosClusterWaitForK8s(ctxDeadline, endpoint, controlPlaneNodes, talosConfig); err != nil {
+	clusterReporter := newReporter()
+
+	if err = talosClusterWaitForK8s(ctxDeadline, endpoint, controlPlaneNodes, talosConfig, clusterReporter); err != nil {
+		if progress := clusterReporter.String(); progress != "" {
+			resp.Diagnostics.AddWarning("failed checks", progress)
+		}
+
 		resp.Diagnostics.AddError("error waiting for cluster health", err.Error())
 
 		return
@@ -408,7 +414,7 @@ func talosClusterBootstrap(ctx context.Context, endpoint, node string, talosConf
 }
 
 // talosClusterWaitForK8s waits for the cluster to pass all default health checks.
-func talosClusterWaitForK8s(ctx context.Context, endpoint string, controlPlaneNodes []string, talosConfig *clientconfig.Config) error {
+func talosClusterWaitForK8s(ctx context.Context, endpoint string, controlPlaneNodes []string, talosConfig *clientconfig.Config, progress *reporter) error {
 	c, err := client.New(ctx, client.WithConfig(talosConfig), client.WithEndpoints(endpoint))
 	if err != nil {
 		return err
@@ -434,7 +440,7 @@ func talosClusterWaitForK8s(ctx context.Context, endpoint string, controlPlaneNo
 		Info:           nodeInfos,
 	}
 
-	return check.Wait(ctx, &clusterState, check.PreBootSequenceChecks(), newReporter())
+	return check.Wait(ctx, &clusterState, check.PreBootSequenceChecks(), progress)
 }
 
 // talosClusterUpgradeKubernetes runs a rolling Kubernetes upgrade via the talos cluster package.

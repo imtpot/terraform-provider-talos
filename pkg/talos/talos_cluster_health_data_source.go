@@ -81,9 +81,16 @@ func (c *clusterNodes) NodesByType(t machine.Type) []cluster.NodeInfo {
 	return c.nodesByType[t]
 }
 
+// reporter keeps one status line per distinct check, updating that line in place
+// as the check's state or last error changes, as long as each check in the list
+// has a stable, unique conditions.Condition.String(). For every check.ClusterCheck
+// in this package (all conditions.PollingCondition with a fixed description),
+// that holds, so the line count stays bounded by the number of checks being run
+// regardless of how many times a check is polled before it succeeds or the
+// overall wait times out.
 type reporter struct {
-	lastLine string
-	s        strings.Builder
+	lastCondition string
+	lines         []string
 }
 
 func newReporter() *reporter {
@@ -92,15 +99,24 @@ func newReporter() *reporter {
 
 // Update implements the conditions.Reporter interface.
 func (r *reporter) Update(condition conditions.Condition) {
-	if condition.String() != r.lastLine {
-		fmt.Fprintf(&r.s, "waiting for %s\n", condition.String())
-		r.lastLine = condition.String()
+	name := condition.String()
+	line := conditions.StatusLine(condition)
+
+	if name != r.lastCondition {
+		r.lines = append(r.lines, line)
+		r.lastCondition = name
+
+		return
+	}
+
+	if len(r.lines) > 0 {
+		r.lines[len(r.lines)-1] = line
 	}
 }
 
-// String returns the string representation of the reporter.
+// String returns the recorded status lines, one per check.
 func (r *reporter) String() string {
-	return r.s.String()
+	return strings.Join(r.lines, "\n")
 }
 
 // NewTalosClusterHealthDataSource implements the datasource.DataSource interface.
@@ -261,7 +277,7 @@ func (d *talosClusterHealthDataSource) Read(ctx context.Context, req datasource.
 	checkCtx, checkCtxCancel := context.WithTimeout(ctx, readTimeout)
 	defer checkCtxCancel()
 
-	reporter := newReporter()
+	progress := newReporter()
 
 	checks := check.PreBootSequenceChecks()
 
@@ -269,8 +285,11 @@ func (d *talosClusterHealthDataSource) Read(ctx context.Context, req datasource.
 		checks = check.DefaultClusterChecks()
 	}
 
-	if err := check.Wait(checkCtx, &clusterState, checks, reporter); err != nil {
-		resp.Diagnostics.AddWarning("failed checks", reporter.String())
+	if err := check.Wait(checkCtx, &clusterState, checks, progress); err != nil {
+		if s := progress.String(); s != "" {
+			resp.Diagnostics.AddWarning("failed checks", s)
+		}
+
 		resp.Diagnostics.AddError("cluster health check failed", err.Error())
 
 		return
