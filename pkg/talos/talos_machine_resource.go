@@ -650,7 +650,7 @@ func (r *talosMachineResource) Update(ctx context.Context, req resource.UpdateRe
 	imageChanged := !plan.Image.IsNull() && !plan.Image.Equal(state.Image)
 
 	if imageChanged {
-		if err := talosMachineUpgrade(ctxDeadline, endpoint, plan.Node.ValueString(), talosConfig, &plan); err != nil {
+		if err := talosMachineUpgrade(ctxDeadline, endpoint, plan.Node.ValueString(), talosConfig, &plan, true); err != nil {
 			resp.Diagnostics.AddError("error upgrading Talos", err.Error())
 
 			return
@@ -825,7 +825,7 @@ func talosMachineCheckBootReady(ctx context.Context, c *client.Client) error {
 
 // talosMachineUpgrade upgrades the Talos OS to the desired installer image
 // by performing: pull → install → drain → reboot → uncordon.
-func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel) (retErr error) {
+func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, state *talosMachineResourceModel, waitForKubernetes bool) (retErr error) {
 	rebootModeStr := strings.ToUpper(state.RebootMode.ValueString())
 
 	containerdInst := &commonapi.ContainerdInstance{
@@ -871,7 +871,7 @@ func talosMachineUpgrade(ctx context.Context, endpoint, node string, talosConfig
 		}
 	}()
 
-	if err := talosMachineReboot(ctx, endpoint, node, talosConfig, rebootModeStr); err != nil {
+	if err := talosMachineReboot(ctx, endpoint, node, talosConfig, rebootModeStr, waitForKubernetes); err != nil {
 		return fmt.Errorf("waiting for node after reboot: %w", err)
 	}
 
@@ -888,7 +888,7 @@ func talosMachineUpgradeIfNeeded(ctx context.Context, endpoint, node string, tal
 	}
 
 	if runningImage != state.Image.ValueString() {
-		return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state)
+		return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state, false)
 	}
 
 	requestedSchematic, isImageFactoryImage := talosMachineImageFactorySchematic(state.Image.ValueString())
@@ -905,7 +905,7 @@ func talosMachineUpgradeIfNeeded(ctx context.Context, endpoint, node string, tal
 		return nil
 	}
 
-	return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state)
+	return talosMachineUpgrade(ctx, endpoint, node, talosConfig, state, false)
 }
 
 // talosMachineImageFactorySchematic returns the schematic ID embedded in the standard
@@ -1122,7 +1122,7 @@ func kubeclientFromRaw(kubeconfigBytes []byte) (kubernetes.Interface, error) {
 	return cs, nil
 }
 
-func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, rebootModeStr string) error {
+func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig *clientconfig.Config, rebootModeStr string, waitForKubernetes bool) error {
 	rebootModeVal, ok := machineapi.RebootRequest_Mode_value[rebootModeStr]
 	if !ok {
 		rebootModeVal = int32(machineapi.RebootRequest_DEFAULT)
@@ -1130,9 +1130,16 @@ func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig 
 
 	rebootMode := machineapi.RebootRequest_Mode(rebootModeVal)
 
-	return action.NewTracker(
+	expectedEvent := action.MachineReadyEventFn
+	if !waitForKubernetes {
+		// Create can precede etcd bootstrap. Observe shutdown, then prove a new
+		// boot via BootIDChangedPostCheckFn before waiting for CRI below.
+		expectedEvent = action.StopAllServicesEventFn
+	}
+
+	if err := action.NewTracker(
 		newTalosClientFactory(talosConfig, endpoint, []string{node}),
-		action.MachineReadyEventFn,
+		expectedEvent,
 		func(rebootCtx context.Context, c *client.Client) (string, error) {
 			resp, err := c.RebootWithResponse(rebootCtx, client.WithRebootMode(rebootMode))
 			if err != nil {
@@ -1147,7 +1154,15 @@ func talosMachineReboot(ctx context.Context, endpoint, node string, talosConfig 
 		},
 		action.WithPostCheck(action.BootIDChangedPostCheckFn),
 		action.WithTimeout(15*time.Minute),
-	).Run(ctx)
+	).Run(ctx); err != nil {
+		return err
+	}
+
+	if !waitForKubernetes {
+		return talosMachineWaitForBoot(ctx, endpoint, node, talosConfig, talosClientOp)
+	}
+
+	return nil
 }
 
 // talosMachineBootID reads the node's boot ID, which the kernel regenerates on every boot.
